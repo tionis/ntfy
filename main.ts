@@ -171,14 +171,14 @@ interface cachedNtfyToken {
 
 const ntfyTokenCache = new Map<string, cachedNtfyToken>();
 
-function getNtfyToken(token: string): ntfyToken {
+async function getNtfyToken(token: string): Promise<ntfyToken> {
   const cached = ntfyTokenCache.get(token);
   if (cached) {
     if (cached.validUntil.getTime() > Date.now()) {
       return cached.token;
     }
   }
-  const tokenContents = ntfyDavClient.getFileContents(
+  const tokenContents = await ntfyDavClient.getFileContents(
     "tokens/" + token + ".yaml",
   );
   const unmarshalled = UnmarshallNtfyToken(
@@ -196,7 +196,7 @@ async function handleNtfyRequest(request: Request) {
   if (!token) {
     token = "public";
   }
-  const ntfyToken = getNtfyToken(token);
+  const ntfyToken = await getNtfyToken(token);
   const url = new URL(request.url);
   const channel = url.pathname.slice(1);
   if (!ntfyToken.channelRegex.test(channel)) {
