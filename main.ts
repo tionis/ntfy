@@ -1,11 +1,17 @@
-#!/usr/bin/env -S deno run --allow-net=cloud.tionis.dev,ntfy.tionis.dev --allow-env --unstable-cron
+#!/usr/bin/env -S deno run --allow-net=api.telegram.org:443,cloud.tionis.dev,ntfy.tionis.dev,0.0.0.0:8080 --allow-env --unstable-cron
 import * as webdav from "npm:webdav";
 import * as yaml from "jsr:@std/yaml";
 
-const token = Deno.env.get("DEADMAN_SWITCH_TOKEN")
-const client = webdav.createClient(
+const deadManToken = Deno.env.get("DEADMAN_SWITCH_TOKEN");
+const deadManDavClient = webdav.createClient(
   "https://cloud.tionis.dev/public.php/webdav",
-  { username: token, password: "" },
+  { username: deadManToken, password: "" },
+);
+
+const ntfyWebDavToken = Deno.env.get("NTFY_WEBDAV_TOKEN");
+const ntfyDavClient = webdav.createClient(
+  "https://cloud.tionis.dev/public.php/webdav",
+  { username: ntfyWebDavToken, password: "" },
 );
 
 interface trigger {
@@ -63,10 +69,10 @@ function parseModTime(modTime: string): Date {
 }
 
 async function checkDeadManTriggers() {
-  const directoryContents = await client.getDirectoryContents("/");
-  const triggers = (directoryContents as webdav.FileStat[]).filter((d) =>
-    d.type === "directory"
-  ).map((x) => x.basename);
+  const directoryContents = await deadManDavClient.getDirectoryContents("/");
+  const triggers = (directoryContents as webdav.FileStat[])
+    .filter((d) => d.type === "directory")
+    .map((x) => x.basename);
   for (const triggerName of triggers) {
     try {
       console.log(`Checking trigger: ${triggerName}`);
@@ -75,13 +81,13 @@ async function checkDeadManTriggers() {
       // /lastNotification -> last notification time in mod time timestamp
       // /config.yaml -> config of trigger (fulfills trigger interface)
 
-      const fileContents = await client.getFileContents(
+      const fileContents = await deadManDavClient.getFileContents(
         `${triggerName}/config.yaml`,
       );
       const config = yaml.parse(fileContents.toString()) as trigger;
-      const dirContents = await client.getDirectoryContents(
+      const dirContents = (await deadManDavClient.getDirectoryContents(
         triggerName,
-      ) as webdav.FileStat[];
+      )) as webdav.FileStat[];
       const lastPingFile = dirContents.find((x) => x.basename === "ping");
       if (!lastPingFile || !lastPingFile.lastmod) {
         console.log(dirContents);
@@ -91,8 +97,8 @@ async function checkDeadManTriggers() {
         );
       }
       const lastPing = parseModTime(lastPingFile.lastmod);
-      const lastNotificationFile = dirContents.find((x) =>
-        x.basename === "lastNotification"
+      const lastNotificationFile = dirContents.find(
+        (x) => x.basename === "lastNotification",
       );
       let lastNotification: Date | undefined;
       if (lastNotificationFile && lastNotificationFile.lastmod) {
@@ -115,7 +121,7 @@ async function checkDeadManTriggers() {
             triggerName,
             `Last Ping was at ${lastPing.toUTCString()} but should have been within ${config.PingDelaySeconds} seconds`,
           );
-          await client.putFileContents(
+          await deadManDavClient.putFileContents(
             `${triggerName}/lastNotification`,
             now.toUTCString(),
           );
@@ -124,14 +130,14 @@ async function checkDeadManTriggers() {
     } catch (e) {
       console.error(e);
       // Append error to log over webdav
-      const lock = await client.lock(`${triggerName}/error.log`);
+      const lock = await deadManDavClient.lock(`${triggerName}/error.log`);
       const logFile = `${triggerName}/error.log`;
-      const logContents = await client.getFileContents(logFile);
-      await client.putFileContents(
+      const logContents = await deadManDavClient.getFileContents(logFile);
+      await deadManDavClient.putFileContents(
         logFile,
         `${logContents.toString()}\n${e.toString()}`,
       );
-      await client.unlock(`${triggerName}/error.log`, lock.token);
+      await deadManDavClient.unlock(`${triggerName}/error.log`, lock.token);
     }
   }
 }
@@ -139,3 +145,85 @@ async function checkDeadManTriggers() {
 Deno.cron("Check for dead man triggers", "*/5 * * * *", checkDeadManTriggers);
 
 checkDeadManTriggers();
+
+interface marshalledNtfyToken {
+  channelRegex: string;
+  name: string;
+}
+
+interface ntfyToken {
+  channelRegex: RegExp;
+  name: string;
+}
+
+function UnmarshallNtfyToken(token: marshalledNtfyToken): ntfyToken {
+  return {
+    channelRegex: new RegExp(token.channelRegex),
+    name: token.name,
+  };
+}
+
+const ntfyTokenValidDuration = 1000 * 60 * 1; // 1 minute
+interface cachedNtfyToken {
+  token: ntfyToken;
+  validUntil: Date;
+}
+
+const ntfyTokenCache = new Map<string, cachedNtfyToken>();
+
+function getNtfyToken(token: string): ntfyToken {
+  const cached = ntfyTokenCache.get(token);
+  if (cached) {
+    if (cached.validUntil.getTime() > Date.now()) {
+      return cached.token;
+    }
+  }
+  const tokenContents = ntfyDavClient.getFileContents(
+    "tokens/" + token + ".yaml",
+  );
+  const unmarshalled = UnmarshallNtfyToken(
+    yaml.parse(tokenContents.toString()) as marshalledNtfyToken,
+  );
+  ntfyTokenCache.set(token, {
+    token: unmarshalled,
+    validUntil: new Date(Date.now() + ntfyTokenValidDuration),
+  });
+  return unmarshalled;
+}
+
+async function handleNtfyRequest(request: Request) {
+  let token = request.headers.get("Authorization");
+  if (!token) {
+    token = "public";
+  }
+  const ntfyToken = getNtfyToken(token);
+  const url = new URL(request.url);
+  const channel = url.pathname.slice(1);
+  if (!ntfyToken.channelRegex.test(channel)) {
+    return new Response("Unauthorized", { status: 403 });
+  }
+
+  const silent = url.searchParams.get("silent") === "true";
+  const format = url.searchParams.get("format");
+
+  switch (format) {
+    case "json":
+      await notify(ntfyToken.name, channel, await request.json(), silent);
+      return new Response("OK", { status: 200 });
+    case "apprise_json": {
+      const req_json = await request.json();
+      const message = `# ${req_json.title || "no title"} (${
+        req_json.type || "no type"
+      })\n${req_json.message}`;
+      await notify(ntfyToken.name, channel, message, silent);
+      return new Response("OK", { status: 200 });
+    }
+    case "md":
+    case "markdown":
+    default:
+      await notify(ntfyToken.name, channel, await request.text(), silent);
+      return new Response("OK", { status: 200 });
+  }
+}
+
+Deno.serve({ port: 8080 }, handleNtfyRequest);
