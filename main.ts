@@ -165,7 +165,7 @@ function UnmarshallNtfyToken(token: marshalledNtfyToken): ntfyToken {
 
 const ntfyTokenValidDuration = 1000 * 60 * 1; // 1 minute
 interface cachedNtfyToken {
-  token: ntfyToken;
+  token: ntfyToken | null;
   validUntil: Date;
 }
 
@@ -175,12 +175,28 @@ async function getNtfyToken(token: string): Promise<ntfyToken> {
   const cached = ntfyTokenCache.get(token);
   if (cached) {
     if (cached.validUntil.getTime() > Date.now()) {
+      if (!cached.token) {
+        throw new Error("Token not found");
+      }
       return cached.token;
     }
   }
-  const tokenContents = await ntfyDavClient.getFileContents(
-    "tokens/" + token + ".yaml",
-  );
+  let tokenContents:
+    | string
+    | webdav.BufferLike
+    | webdav.ResponseDataDetailed<string | webdav.BufferLike>;
+  try {
+    tokenContents = await ntfyDavClient.getFileContents(
+      "tokens/" + token + ".yaml",
+    );
+  } catch (e) {
+    console.error(e);
+    ntfyTokenCache.set(token, {
+      token: null,
+      validUntil: new Date(Date.now() + ntfyTokenValidDuration),
+    });
+    throw new Error("Token not found");
+  }
   const unmarshalled = UnmarshallNtfyToken(
     yaml.parse(tokenContents.toString()) as marshalledNtfyToken,
   );
@@ -193,11 +209,22 @@ async function getNtfyToken(token: string): Promise<ntfyToken> {
 
 async function handleNtfyRequest(request: Request) {
   let token = request.headers.get("Authorization");
-  if (!token) {
-    token = "public";
-  }
-  const ntfyToken = await getNtfyToken(token);
   const url = new URL(request.url);
+  const queryToken = url.searchParams.get("token");
+  if (!token) {
+    if (queryToken) {
+      token = queryToken;
+    } else {
+      token = "public";
+    }
+  }
+  let ntfyToken;
+  try {
+    ntfyToken = await getNtfyToken(token);
+  } catch (e) {
+    console.error(e);
+    return new Response("Unauthorized", { status: 403 });
+  }
   const channel = url.pathname.slice(1);
   if (!ntfyToken.channelRegex.test(channel)) {
     return new Response("Unauthorized", { status: 403 });
@@ -205,24 +232,39 @@ async function handleNtfyRequest(request: Request) {
 
   const silent = url.searchParams.get("silent") === "true";
   const format = url.searchParams.get("format");
+  const queryText = url.searchParams.get("message");
+  const isGET = request.method === "GET";
 
   switch (format) {
-    case "json":
-      await notify(ntfyToken.name, channel, await request.json(), silent);
+    case "json": {
+      const data = isGET ? queryText : await request.json();
+      if (data == null) {
+        return new Response("No data found", { status: 400 });
+      }
+      await notify(ntfyToken.name, channel, data, silent);
       return new Response("OK", { status: 200 });
+    }
     case "apprise_json": {
-      const req_json = await request.json();
-      const message = `# ${req_json.title || "no title"} (${
-        req_json.type || "no type"
-      })\n${req_json.message}`;
+      const data = isGET ? queryText : await request.json();
+      if (data == null) {
+        return new Response("No data found", { status: 400 });
+      }
+      const message = `# ${data.title || "no title"} (${
+        data.type || "no type"
+      })\n${data.message}`;
       await notify(ntfyToken.name, channel, message, silent);
       return new Response("OK", { status: 200 });
     }
     case "md":
     case "markdown":
-    default:
-      await notify(ntfyToken.name, channel, await request.text(), silent);
+    default: {
+      const data = queryText ? queryText : await request.text();
+      if (data == null) {
+        return new Response("No data found", { status: 400 });
+      }
+      await notify(ntfyToken.name, channel, data, silent);
       return new Response("OK", { status: 200 });
+    }
   }
 }
 
