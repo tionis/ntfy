@@ -2,6 +2,7 @@
 import * as webdav from "npm:webdav";
 import * as yaml from "jsr:@std/yaml";
 
+// TODO somehow replace this with some other backend
 const deadManToken = Deno.env.get("DEADMAN_SWITCH_TOKEN");
 const deadManDavClient = webdav.createClient(
   "https://cloud.tionis.dev/public.php/webdav",
@@ -12,7 +13,7 @@ const ntfyWebDavToken = Deno.env.get("NTFY_WEBDAV_TOKEN");
 const ntfyDavClient = webdav.createClient(
   "https://cloud.tionis.dev/public.php/webdav",
   { username: ntfyWebDavToken, password: "" },
-);
+); // TODO replace this with a modular backend, and implement it for the github API.
 
 interface trigger {
   PingDelaySeconds: number;
@@ -208,6 +209,11 @@ async function getNtfyToken(token: string): Promise<ntfyToken> {
 }
 
 async function handleNtfyRequest(request: Request) {
+  // If request is for /healthz return 200 OK
+  if (new URL(request.url).pathname === "/healthz") {
+    return new Response("OK", { status: 200 });
+  }
+
   let token = request.headers.get("Authorization");
   const url = new URL(request.url);
   const queryToken = url.searchParams.get("token");
