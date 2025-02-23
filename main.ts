@@ -143,9 +143,9 @@ async function checkDeadManTriggers() {
   }
 }
 
-Deno.cron("Check for dead man triggers", "*/5 * * * *", checkDeadManTriggers);
+//Deno.cron("Check for dead man triggers", "*/5 * * * *", checkDeadManTriggers);
 
-checkDeadManTriggers();
+//checkDeadManTriggers();
 
 interface marshalledNtfyToken {
   channelRegex: string;
