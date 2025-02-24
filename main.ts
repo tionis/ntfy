@@ -1,19 +1,7 @@
 #!/usr/bin/env -S deno run --allow-net=api.telegram.org:443,cloud.tionis.dev,ntfy.tionis.dev,0.0.0.0:8080 --allow-env --unstable-cron
-import * as webdav from "npm:webdav";
 import * as yaml from "jsr:@std/yaml";
 
-// TODO somehow replace this with some other backend
-const deadManToken = Deno.env.get("DEADMAN_SWITCH_TOKEN");
-const deadManDavClient = webdav.createClient(
-  "https://cloud.tionis.dev/public.php/webdav",
-  { username: deadManToken, password: "" },
-);
-
-const ntfyWebDavToken = Deno.env.get("NTFY_WEBDAV_TOKEN");
-const ntfyDavClient = webdav.createClient(
-  "https://cloud.tionis.dev/public.php/webdav",
-  { username: ntfyWebDavToken, password: "" },
-); // TODO replace this with a modular backend, and implement it for the github API.
+const config_url = Deno.env.get("NTFY_CONFIG_URL");
 
 interface trigger {
   PingDelaySeconds: number;
@@ -61,91 +49,6 @@ async function notify(
     throw new Error("Failed to send notification");
   }
 }
-
-/*
-  Parses webdav style modTimes (e.g. "Tue, 08 Oct 2024 00:18:15 GMT") into Date objects
-*/
-function parseModTime(modTime: string): Date {
-  return new Date(modTime);
-}
-
-async function checkDeadManTriggers() {
-  const directoryContents = await deadManDavClient.getDirectoryContents("/");
-  const triggers = (directoryContents as webdav.FileStat[])
-    .filter((d) => d.type === "directory")
-    .map((x) => x.basename);
-  for (const triggerName of triggers) {
-    try {
-      console.log(`Checking trigger: ${triggerName}`);
-      // File structure:
-      // /ping -> last ping time in mod time timestamp
-      // /lastNotification -> last notification time in mod time timestamp
-      // /config.yaml -> config of trigger (fulfills trigger interface)
-
-      const fileContents = await deadManDavClient.getFileContents(
-        `${triggerName}/config.yaml`,
-      );
-      const config = yaml.parse(fileContents.toString()) as trigger;
-      const dirContents = (await deadManDavClient.getDirectoryContents(
-        triggerName,
-      )) as webdav.FileStat[];
-      const lastPingFile = dirContents.find((x) => x.basename === "ping");
-      if (!lastPingFile || !lastPingFile.lastmod) {
-        console.log(dirContents);
-        console.log(lastPingFile);
-        throw new Error(
-          `Ping file or lastmod not found for trigger: ${triggerName}`,
-        );
-      }
-      const lastPing = parseModTime(lastPingFile.lastmod);
-      const lastNotificationFile = dirContents.find(
-        (x) => x.basename === "lastNotification",
-      );
-      let lastNotification: Date | undefined;
-      if (lastNotificationFile && lastNotificationFile.lastmod) {
-        lastNotification = parseModTime(lastNotificationFile.lastmod);
-      }
-      const now = new Date();
-      const timeSincePing = now.getTime() - lastPing.getTime();
-      const timeSinceNotification = lastNotification
-        ? now.getTime() - lastNotification.getTime()
-        : Number.MAX_SAFE_INTEGER;
-      if (timeSincePing > config.PingDelaySeconds * 1000) {
-        if (
-          !lastNotification ||
-          timeSinceNotification >
-            (config.NotificationRepeatDelaySeconds || config.PingDelaySeconds) *
-              1000
-        ) {
-          await notify(
-            "deadManSwitchOperator",
-            triggerName,
-            `Last Ping was at ${lastPing.toUTCString()} but should have been within ${config.PingDelaySeconds} seconds`,
-          );
-          await deadManDavClient.putFileContents(
-            `${triggerName}/lastNotification`,
-            now.toUTCString(),
-          );
-        }
-      }
-    } catch (e) {
-      console.error(e);
-      // Append error to log over webdav
-      const lock = await deadManDavClient.lock(`${triggerName}/error.log`);
-      const logFile = `${triggerName}/error.log`;
-      const logContents = await deadManDavClient.getFileContents(logFile);
-      await deadManDavClient.putFileContents(
-        logFile,
-        `${logContents.toString()}\n${e.toString()}`,
-      );
-      await deadManDavClient.unlock(`${triggerName}/error.log`, lock.token);
-    }
-  }
-}
-
-//Deno.cron("Check for dead man triggers", "*/5 * * * *", checkDeadManTriggers);
-
-//checkDeadManTriggers();
 
 interface marshalledNtfyToken {
   channelRegex: string;
